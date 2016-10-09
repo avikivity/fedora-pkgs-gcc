@@ -1,0 +1,189 @@
+From f0613e957288dd5d3b8b42932ac7e810e18a5906 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Pawe=C5=82=20Dziepak?= <pdziepak@scylladb.com>
+Date: Wed, 27 Jan 2016 10:06:29 +0000
+Subject: [PATCH 9003/9003] asan: better support for swapcontext() and
+ setcontext()
+
+This patch makes swapcontext() and setcontext() update stack information
+in AsanThread each time the stack is changed. It is still far from full
+support of these functions but at least makes __asan_handle_no_return()
+work correctly on a custom user stack.
+---
+ libsanitizer/asan/asan_interceptors.cc | 22 +++++++++++++++++++++
+ libsanitizer/asan/asan_thread.cc       | 13 +++++++++----
+ libsanitizer/asan/asan_thread.h        | 35 +++++++++++++++++++++++++++++++---
+ 3 files changed, 63 insertions(+), 7 deletions(-)
+
+diff --git a/libsanitizer/asan/asan_interceptors.cc b/libsanitizer/asan/asan_interceptors.cc
+index 7c4b1ab..6cfe5fd 100644
+--- a/libsanitizer/asan/asan_interceptors.cc
++++ b/libsanitizer/asan/asan_interceptors.cc
+@@ -332,21 +332,42 @@ INTERCEPTOR(int, swapcontext, struct ucontext_t *oucp,
+   ClearShadowMemoryForContextStack(stack, ssize);
+ 
+   AsanThread *curr_thread = GetCurrentThread();
+   if (curr_thread) {
+     WriteContextStack(oucp, curr_thread->stack_bottom(), curr_thread->stack_size());
++    curr_thread->SetUserStack(stack, ssize);
+   }
+ 
+   int res = REAL(swapcontext)(oucp, ucp);
++  if (res && curr_thread) {
++    curr_thread->RestorePreviousUserStack();
++  }
+   // swapcontext technically does not return, but program may swap context to
+   // "oucp" later, that would look as if swapcontext() returned 0.
+   // We need to clear shadow for ucp once again, as it may be in arbitrary
+   // state.
+   ClearShadowMemoryForContextStack(stack, ssize);
+   return res;
+ }
+ 
++INTERCEPTOR(int, setcontext, struct ucontext_t *ucp) {
++  uptr stack, ssize;
++  ReadContextStack(ucp, &stack, &ssize);
++  ClearShadowMemoryForContextStack(stack, ssize);
++
++  AsanThread *curr_thread = GetCurrentThread();
++  if (curr_thread) {
++      curr_thread->SetUserStack(stack, ssize);
++  }
++
++  int res = REAL(setcontext)(ucp);
++  if (res && curr_thread) {
++      curr_thread->RestorePreviousUserStack();
++  }
++  return res;
++}
++
+ INTERCEPTOR(int, getcontext, struct ucontext_t *ucp) {
+   int res = REAL(getcontext)(ucp);
+   AsanThread *curr_thread = GetCurrentThread();
+   if (!res && curr_thread) {
+     WriteContextStack(ucp, curr_thread->stack_bottom(), curr_thread->stack_size());
+@@ -793,10 +814,11 @@ void InitializeAsanInterceptors() {
+ #endif
+   ASAN_INTERCEPT_FUNC(signal);
+ #endif
+ #if ASAN_INTERCEPT_SWAPCONTEXT
+   ASAN_INTERCEPT_FUNC(swapcontext);
++  ASAN_INTERCEPT_FUNC(setcontext);
+   ASAN_INTERCEPT_FUNC(getcontext);
+ #endif
+ #if ASAN_INTERCEPT__LONGJMP
+   ASAN_INTERCEPT_FUNC(_longjmp);
+ #endif
+diff --git a/libsanitizer/asan/asan_thread.cc b/libsanitizer/asan/asan_thread.cc
+index fc8b3e5..dcbb184 100644
+--- a/libsanitizer/asan/asan_thread.cc
++++ b/libsanitizer/asan/asan_thread.cc
+@@ -146,10 +146,14 @@ FakeStack *AsanThread::AsyncSignalSafeLazyInitFakeStack() {
+   }
+   return nullptr;
+ }
+ 
+ void AsanThread::Init() {
++  temp_stack_ = &stacks_[0];
++  next_stack_ = &stacks_[1];
++  previous_stack_ = &stacks_[2];
++
+   fake_stack_ = nullptr;  // Will be initialized lazily if needed.
+   CHECK_EQ(this->stack_size(), 0U);
+   SetThreadStackAndTls();
+   CHECK_GT(this->stack_size(), 0U);
+   CHECK(AddrIsInMem(stack_bottom()));
+@@ -191,14 +195,15 @@ thread_return_t AsanThread::ThreadStart(
+   return res;
+ }
+ 
+ void AsanThread::SetThreadStackAndTls() {
+   uptr tls_size = 0;
+-  GetThreadStackAndTls(tid() == 0, &current_stack_.stack_bottom,
+-                       &current_stack_.stack_size, &tls_begin_, &tls_size);
+-  current_stack_.stack_top = current_stack_.stack_bottom
+-                             + current_stack_.stack_size;
++  GetThreadStackAndTls(tid() == 0, &next_stack_->stack_bottom,
++                       &next_stack_->stack_size, &tls_begin_, &tls_size);
++  next_stack_->stack_top = next_stack_->stack_bottom + next_stack_->stack_size;
++  previous_stack_->stack_top = previous_stack_->stack_bottom = 0;
++  previous_stack_->stack_size = 0;
+   tls_end_ = tls_begin_ + tls_size;
+ 
+   int local;
+   CHECK(AddrIsInStack((uptr)&local));
+ }
+diff --git a/libsanitizer/asan/asan_thread.h b/libsanitizer/asan/asan_thread.h
+index 335cf59..f0190ad 100644
+--- a/libsanitizer/asan/asan_thread.h
++++ b/libsanitizer/asan/asan_thread.h
+@@ -74,10 +74,25 @@ class AsanThread {
+   uptr tls_end() { return tls_end_; }
+   u32 tid() { return context_->tid; }
+   AsanThreadContext *context() { return context_; }
+   void set_context(AsanThreadContext *context) { context_ = context; }
+ 
++  void SetUserStack(uptr base, uptr size) {
++    temp_stack_->stack_bottom = base;
++    temp_stack_->stack_top = base + size;
++    temp_stack_->stack_size = size;
++
++    StackDescriptor* oprev = previous_stack_;
++    previous_stack_ = next_stack_;
++    next_stack_ = temp_stack_;
++    temp_stack_ = oprev;
++  }
++
++  void RestorePreviousUserStack() {
++    SetUserStack(previous_stack_->stack_bottom, previous_stack_->stack_size);
++  }
++
+   struct StackFrameAccess {
+     uptr offset;
+     uptr frame_pc;
+     const char *frame_descr;
+   };
+@@ -86,11 +101,16 @@ class AsanThread {
+   bool AddrIsInStack(StackDescriptor *stack, uptr addr) {
+     return addr >= stack->stack_bottom && addr < stack->stack_top;
+   }
+ 
+   StackDescriptor *CurrentStack() {
+-    return &current_stack_;
++    int local;
++    if (AddrIsInStack(previous_stack_, (uptr)&local)) {
++        return previous_stack_;
++    } else {
++        return next_stack_;
++    }
+   }
+ 
+   bool AddrIsInStack(uptr addr) {
+     return AddrIsInStack(CurrentStack(), addr);
+   }
+@@ -136,12 +156,21 @@ class AsanThread {
+   FakeStack *AsyncSignalSafeLazyInitFakeStack();
+ 
+   AsanThreadContext *context_;
+   thread_callback_t start_routine_;
+   void *arg_;
+-  // It needs to be set in a async-signal-safe manner.
+-  StackDescriptor current_stack_;
++
++  // We have three stack descriptor for async-signal-safe stack change. New stack
++  // information is written to temp_stack_. Then previous_stack_ is made to
++  // point to the same descriptor that next_stack_ does. Finally, temp_stack_
++  // is assigned to next_stack_. The result is that at any time either
++  // previous_stack_ or next_stack_ contain the correct stack information.
++  StackDescriptor stacks_[3];
++  StackDescriptor* temp_stack_;
++  StackDescriptor* next_stack_;
++  StackDescriptor* previous_stack_;
++
+   uptr tls_begin_;
+   uptr tls_end_;
+ 
+   FakeStack *fake_stack_;
+   AsanThreadLocalMallocStorage malloc_storage_;
+-- 
+2.7.4
+

@@ -86,7 +86,7 @@
 Summary: Various compilers (C, C++, Objective-C, Java, ...)
 Name: gcc
 Version: %{gcc_version}
-Release: %{gcc_release}%{?dist}
+Release: %{gcc_release}%{?dist}.scylladb
 # libgcc, libgfortran, libgomp, libstdc++ and crtstuff have
 # GCC Runtime Exception.
 License: GPLv3+ and GPLv3+ with exceptions and GPLv2+ with exceptions and LGPLv2+ and BSD
@@ -207,6 +207,10 @@ Patch10: gcc6-no-add-needed.patch
 Patch11: gcc6-libgo-p224.patch
 Patch12: gcc6-aarch64-async-unw-tables.patch
 Patch13: gcc6-libsanitize-aarch64-va42.patch
+
+Patch9001: 9001-asan-make-getcontext-and-swapcontext-write-stack-des.patch
+Patch9002: 9002-asan-introduce-AsanThread-StackDescriptor.patch
+Patch9003: 9003-asan-better-support-for-swapcontext-and-setcontext.patch
 
 # On ARM EABI systems, we do want -gnueabi to be part of the
 # target triple.
@@ -773,6 +777,9 @@ package or when debugging this package.
 rm -f libgo/go/crypto/elliptic/p224{,_test}.go
 %patch12 -p0 -b .aarch64-async-unw-tables~
 %patch13 -p0 -b .libsanitize-aarch64-va42~
+%patch9001 -p1 -b .9001~
+%patch9002 -p1 -b .9002~
+%patch9003 -p1 -b .9003~
 
 %if 0%{?_enable_debug_packages}
 mkdir dwz-wrapper

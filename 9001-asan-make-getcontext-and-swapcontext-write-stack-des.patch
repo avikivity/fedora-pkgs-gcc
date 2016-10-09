@@ -1,0 +1,154 @@
+From f126c82071d759a488bba83698ecb39eebfa0ad6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Pawe=C5=82=20Dziepak?= <pdziepak@scylladb.com>
+Date: Wed, 27 Jan 2016 09:24:50 +0000
+Subject: [PATCH 9001/9003] asan: make getcontext() and swapcontext() write
+ stack description
+
+Normally, ucontext_t::uc_stack is only used by makecontext() and not
+written to or read from any other *context() functions. However, if
+making sure that it contains proper stack description can make improving
+support for swapcontext() much easier.
+---
+ libsanitizer/asan/asan_interceptors.cc | 16 ++++++++++++++++
+ libsanitizer/asan/asan_internal.h      |  1 +
+ libsanitizer/asan/asan_linux.cc        | 10 ++++++++++
+ libsanitizer/asan/asan_mac.cc          |  4 ++++
+ libsanitizer/asan/asan_win.cc          |  4 ++++
+ 5 files changed, 35 insertions(+)
+
+diff --git a/libsanitizer/asan/asan_interceptors.cc b/libsanitizer/asan/asan_interceptors.cc
+index 356f2c0..7c4b1ab 100644
+--- a/libsanitizer/asan/asan_interceptors.cc
++++ b/libsanitizer/asan/asan_interceptors.cc
+@@ -328,18 +328,33 @@ INTERCEPTOR(int, swapcontext, struct ucontext_t *oucp,
+   // Clear shadow memory for new context (it may share stack
+   // with current context).
+   uptr stack, ssize;
+   ReadContextStack(ucp, &stack, &ssize);
+   ClearShadowMemoryForContextStack(stack, ssize);
++
++  AsanThread *curr_thread = GetCurrentThread();
++  if (curr_thread) {
++    WriteContextStack(oucp, curr_thread->stack_bottom(), curr_thread->stack_size());
++  }
++
+   int res = REAL(swapcontext)(oucp, ucp);
+   // swapcontext technically does not return, but program may swap context to
+   // "oucp" later, that would look as if swapcontext() returned 0.
+   // We need to clear shadow for ucp once again, as it may be in arbitrary
+   // state.
+   ClearShadowMemoryForContextStack(stack, ssize);
+   return res;
+ }
++
++INTERCEPTOR(int, getcontext, struct ucontext_t *ucp) {
++  int res = REAL(getcontext)(ucp);
++  AsanThread *curr_thread = GetCurrentThread();
++  if (!res && curr_thread) {
++    WriteContextStack(ucp, curr_thread->stack_bottom(), curr_thread->stack_size());
++  }
++  return res;
++}
+ #endif  // ASAN_INTERCEPT_SWAPCONTEXT
+ 
+ INTERCEPTOR(void, longjmp, void *env, int val) {
+   __asan_handle_no_return();
+   REAL(longjmp)(env, val);
+@@ -778,10 +793,11 @@ void InitializeAsanInterceptors() {
+ #endif
+   ASAN_INTERCEPT_FUNC(signal);
+ #endif
+ #if ASAN_INTERCEPT_SWAPCONTEXT
+   ASAN_INTERCEPT_FUNC(swapcontext);
++  ASAN_INTERCEPT_FUNC(getcontext);
+ #endif
+ #if ASAN_INTERCEPT__LONGJMP
+   ASAN_INTERCEPT_FUNC(_longjmp);
+ #endif
+ #if ASAN_INTERCEPT_SIGLONGJMP
+diff --git a/libsanitizer/asan/asan_internal.h b/libsanitizer/asan/asan_internal.h
+index e31f264..61fd0e2 100644
+--- a/libsanitizer/asan/asan_internal.h
++++ b/libsanitizer/asan/asan_internal.h
+@@ -74,10 +74,11 @@ void AsanCheckIncompatibleRT();
+ void AsanOnDeadlySignal(int, void *siginfo, void *context);
+ 
+ void DisableReexec();
+ void MaybeReexec();
+ void ReadContextStack(void *context, uptr *stack, uptr *ssize);
++void WriteContextStack(void *context, uptr stack, uptr ssize);
+ void StopInitOrderChecking();
+ 
+ // Wrapper for TLS/TSD.
+ void AsanTSDInit(void (*destructor)(void *tsd));
+ void *AsanTSDGet();
+diff --git a/libsanitizer/asan/asan_linux.cc b/libsanitizer/asan/asan_linux.cc
+index 4e47d5a..1e56408 100644
+--- a/libsanitizer/asan/asan_linux.cc
++++ b/libsanitizer/asan/asan_linux.cc
+@@ -160,14 +160,24 @@ void AsanCheckIncompatibleRT() {
+ void ReadContextStack(void *context, uptr *stack, uptr *ssize) {
+   ucontext_t *ucp = (ucontext_t*)context;
+   *stack = (uptr)ucp->uc_stack.ss_sp;
+   *ssize = ucp->uc_stack.ss_size;
+ }
++
++void WriteContextStack(void *context, uptr stack, uptr ssize) {
++  ucontext_t *ucp = (ucontext_t*)context;
++  ucp->uc_stack.ss_sp = (void*)stack;
++  ucp->uc_stack.ss_size = ssize;
++}
+ #else
+ void ReadContextStack(void *context, uptr *stack, uptr *ssize) {
+   UNIMPLEMENTED();
+ }
++
++void WriteContextStack(void *context, uptr stack, uptr ssize) {
++  UNIMPLEMENTED();
++}
+ #endif
+ 
+ void *AsanDlSymNext(const char *sym) {
+   return dlsym(RTLD_NEXT, sym);
+ }
+diff --git a/libsanitizer/asan/asan_mac.cc b/libsanitizer/asan/asan_mac.cc
+index ab3c656..957a64b 100644
+--- a/libsanitizer/asan/asan_mac.cc
++++ b/libsanitizer/asan/asan_mac.cc
+@@ -243,10 +243,14 @@ void AsanCheckIncompatibleRT() {}
+ 
+ void ReadContextStack(void *context, uptr *stack, uptr *ssize) {
+   UNIMPLEMENTED();
+ }
+ 
++void WriteContextStack(void *context, uptr stack, uptr ssize) {
++  UNIMPLEMENTED();
++}
++
+ // Support for the following functions from libdispatch on Mac OS:
+ //   dispatch_async_f()
+ //   dispatch_async()
+ //   dispatch_sync_f()
+ //   dispatch_sync()
+diff --git a/libsanitizer/asan/asan_win.cc b/libsanitizer/asan/asan_win.cc
+index 6c12523..88bc134 100644
+--- a/libsanitizer/asan/asan_win.cc
++++ b/libsanitizer/asan/asan_win.cc
+@@ -194,10 +194,14 @@ void AsanCheckIncompatibleRT() {}
+ 
+ void ReadContextStack(void *context, uptr *stack, uptr *ssize) {
+   UNIMPLEMENTED();
+ }
+ 
++void WriteContextStack(void *context, uptr stack, uptr ssize) {
++  UNIMPLEMENTED();
++}
++
+ void AsanOnDeadlySignal(int, void *siginfo, void *context) {
+   UNIMPLEMENTED();
+ }
+ 
+ static LPTOP_LEVEL_EXCEPTION_FILTER default_seh_handler;
+-- 
+2.7.4
+
